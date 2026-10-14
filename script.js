@@ -174,15 +174,39 @@ function findJjal(query, sem = null) {
 // ★ 여기에 Gemini API 키를 붙여넣으세요 (따옴표 안에, 예: "AIzaSy...")
 const GEMINI_API_KEY = "";
 const GEMINI_MODEL = "gemini-3.1-flash-lite"; // 모델이 종료되면 새 이름으로 바꿔 주세요
-const GEMINI_TIMEOUT_MS = 8000;               // 이 시간 안에 답이 없으면 키워드 결과만 보여줌
+const GEMINI_TIMEOUT_MS = 12000;              // 이 시간 안에 답이 없으면 키워드 결과만 보여줌
 const GEMINI_POINTS = 1.5;                    // AI 점수(1~10) 1점당 더해지는 점수
 
 const DEBUG = new URLSearchParams(location.search).has("debug"); // 주소 뒤에 ?debug=1 이면 점수 표시
 const AI = {
   enabled: GEMINI_API_KEY.trim() !== "",
   cooldownUntil: 0,   // 사용량 한도에 걸렸을 때 잠시 쉬는 시간
-  cache: new Map()    // 같은 문장은 다시 묻지 않고 저장된 결과를 씀
+  cache: new Map(),   // 같은 문장은 다시 묻지 않고 저장된 결과를 씀
+  lastRaw: ""         // Gemini가 마지막으로 보낸 답 (?debug=1 확인용)
 };
+
+// Gemini의 답에서 picks 목록을 꺼내기 (코드블록이나 다른 모양이 섞여도 최대한 읽음)
+function parsePicks(raw) {
+  const text = raw.replace(/```json|```/g, "").trim();
+  const fail = () => {
+    const err = new Error("응답을 해석하지 못함: " + text.slice(0, 80));
+    err.parse = true;
+    return err;
+  };
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    const m = text.match(/[\[{][\s\S]*[\]}]/);
+    if (!m) throw fail();
+    try {
+      data = JSON.parse(m[0]);
+    } catch (e2) {
+      throw fail();
+    }
+  }
+  return Array.isArray(data) ? data : data.picks || data.results || [];
+}
 
 const SYSTEM_PROMPT =
   "너는 '용과같이' 짤 추천기야. 사용자가 보내고 싶은 말이나 지금 기분을 보고, 아래 짤 목록에서 " +
@@ -214,20 +238,30 @@ async function geminiScores(text) {
       }
     );
     if (!res.ok) {
-      const err = new Error("HTTP " + res.status);
+      let detail = "";
+      try {
+        const body = await res.json();
+        detail = (body.error && body.error.message) || "";
+      } catch (e) { /* 본문을 못 읽어도 상태 번호는 남김 */ }
+      const err = new Error("HTTP " + res.status + " " + detail);
       err.status = res.status;
+      err.detail = detail;
       throw err;
     }
     const data = await res.json();
     const parts = (data.candidates && data.candidates[0] && data.candidates[0].content.parts) || [];
     const raw = parts.map(p => p.text || "").join("");
-    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    AI.lastRaw = raw;
+    if (DEBUG) console.log("Gemini 응답:", raw);
+    const picks = parsePicks(raw);
 
     const scores = prepared.map(() => ({ score: 0, raw: 0 }));
-    (parsed.picks || []).forEach(pick => {
-      const idx = Number(pick.id) - 1;
-      const v = Math.min(10, Number(pick.score));
-      if (Number.isInteger(idx) && idx >= 0 && idx < scores.length && v > 0) {
+    picks.forEach(pick => {
+      const idx = parseInt(String(pick.id).replace(/\D/g, ""), 10) - 1;
+      let v = Number(pick.score);
+      if (!(v > 0)) v = 5; // 점수가 빠져 있으면 중간 점수로
+      v = Math.min(10, v);
+      if (Number.isInteger(idx) && idx >= 0 && idx < scores.length) {
         scores[idx] = { score: v * GEMINI_POINTS, raw: v };
       }
     });
@@ -504,7 +538,13 @@ document.addEventListener("DOMContentLoaded", () => {
     // 2) Gemini 결과가 오면 합쳐서 다시 보여주기
     try {
       const sem = await geminiScores(text);
-      setAiStatus("AI 검색이 켜져 있어요. 입력한 문장은 Google Gemini로 전송돼요.", "ready");
+      const found = sem.filter(x => x.raw > 0).length;
+      setAiStatus(
+        DEBUG
+          ? "AI 응답: " + AI.lastRaw.slice(0, 200)
+          : "AI 검색이 켜져 있어요. 입력한 문장은 Google Gemini로 전송돼요." + (found ? "" : " (이번 문장은 AI도 맞는 짤을 못 골랐어요)"),
+        "ready"
+      );
       if (token !== searchToken || !modal.hidden) {
         message.textContent = message.textContent.replace(" (AI가 다시 고르는 중…)", "");
         return; // 그 사이에 새 검색을 했거나 짤을 크게 보는 중이면 화면을 바꾸지 않음
@@ -513,14 +553,23 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (e) {
       console.warn("Gemini 호출 실패", e);
       message.textContent = message.textContent.replace(" (AI가 다시 고르는 중…)", "");
-      if (e.status === 429) {
+      const detail = e.detail ? " [" + e.detail.slice(0, 140) + "]" : "";
+      if (e.name === "AbortError") {
+        setAiStatus("AI 응답이 너무 늦어서 키워드 결과만 보여줘요.", "failed");
+      } else if (e.status === 429) {
         AI.cooldownUntil = Date.now() + 60000;
-        setAiStatus("AI 사용량 한도에 걸렸어요. 잠시 키워드 검색만 써요.", "failed");
-      } else if (e.status === 400 || e.status === 403) {
+        setAiStatus("AI 사용량 한도에 걸렸어요. 잠시 키워드 검색만 써요." + detail, "failed");
+      } else if (e.status === 403 || (e.status === 400 && /api key/i.test(e.detail || ""))) {
         AI.enabled = false;
-        setAiStatus("AI 키가 올바르지 않거나 막혔어요. 키워드 검색만 써요.", "failed");
+        setAiStatus("AI 키가 올바르지 않거나 막혔어요." + detail, "failed");
+      } else if (e.status === 404) {
+        setAiStatus("AI 모델 이름을 찾지 못했어요. GEMINI_MODEL을 확인해 주세요." + detail, "failed");
+      } else if (e.parse) {
+        setAiStatus("AI 답을 해석하지 못했어요. " + e.message, "failed");
+      } else if (e.status) {
+        setAiStatus("AI 호출 오류 (" + e.status + ")" + detail, "failed");
       } else {
-        setAiStatus("AI에 연결하지 못해 키워드 검색 결과예요.", "failed");
+        setAiStatus("AI에 연결하지 못했어요. 네트워크나 브라우저 차단을 확인해 주세요.", "failed");
       }
     }
   }
@@ -576,7 +625,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   if (AI.enabled) {
-    setAiStatus("AI 검색이 켜져 있어요. 입력한 문장은 Google Gemini로 전송돼요.", "ready");
+    setAiStatus("AI 검색 준비됨. 첫 검색 때 Google Gemini에 연결해요.", "idle");
   } else {
     aiStatus.style.display = "none"; // 키가 없으면 키워드 검색만 사용
   }

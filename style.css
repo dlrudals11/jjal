@@ -179,6 +179,48 @@ h1 {
   border-style: dashed;
 }
 
+/* AI 상태 표시 */
+.ai-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 1.4em;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.ai-status.loading {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.ai-status.ready {
+  color: #86efac;
+}
+
+.ai-status.failed {
+  color: #fbbf24;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* ?debug=1 일 때 카드에 보이는 점수 */
+.debug-info {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  padding: 2px 8px;
+  color: #fff;
+  font-size: 0.7rem;
+  background: rgba(0, 0, 0, 0.75);
+  border-radius: 6px;
+}
+
 /* 안내 메시지 */
 .status {
   display: flex;

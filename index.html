@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="하고 싶은 말을 입력하면 그 기분에 맞는 용과같이 짤로 번역해 드립니다.">
+  <meta name="theme-color" content="#0b0a0d">
+  <title>용과같이 짤번역기 — 할 말을 짤로</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🐉%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>용과같이 짤번역기</h1>
+      <p class="sub">할 말을 치면 그 기분에 맞는 짤로 번역해 드립니다. 지금 <b id="count">0</b>장 준비돼 있어요.</p>
+    </header>
+
+    <form id="search-form" class="search" autocomplete="off" role="search">
+      <input id="jjal-input" type="text" placeholder="할 말을 입력하세요 (예: 오늘 진짜 지쳤다)" maxlength="100" aria-label="할 말 입력">
+      <button type="submit" class="btn">번역</button>
+    </form>
+
+    <div id="examples" class="chips" aria-label="예시 문장"></div>
+
+    <div class="status">
+      <p id="message" class="message" aria-live="polite"></p>
+      <button id="share-btn" type="button" class="btn ghost small" hidden>결과 링크 복사</button>
+    </div>
+    <section id="results" class="grid" aria-label="검색 결과"></section>
+
+    <div class="more">
+      <button id="random-btn" type="button" class="btn ghost">아무 짤이나 보기</button>
+    </div>
+
+    <footer>
+      팬이 만든 비공식 사이트입니다. 이미지의 저작권은 각 권리자에게 있습니다.
+    </footer>
+  </main>
+
+  <!-- 큰 화면(짤을 클릭하면 열림) -->
+  <div id="modal" class="modal" hidden role="dialog" aria-modal="true" aria-label="짤 크게 보기">
+    <div class="modal-box">
+      <div class="modal-stage">
+        <button id="modal-prev" type="button" class="nav-btn" aria-label="이전 짤">‹</button>
+        <div id="modal-media" class="modal-media"></div>
+        <button id="modal-next" type="button" class="nav-btn" aria-label="다음 짤">›</button>
+      </div>
+      <p id="modal-count" class="modal-count"></p>
+      <p id="modal-desc" class="modal-desc"></p>
+
+      <div class="phrase-box">
+        <p class="phrase-title">이럴 때 보내세요. 문장을 누르면 복사돼요.</p>
+        <div id="modal-phrases" class="phrases"></div>
+      </div>
+
+      <div class="modal-actions">
+        <a id="modal-download" class="btn" href="#">이미지 저장</a>
+        <button id="modal-close" type="button" class="btn ghost">닫기</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="data.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>

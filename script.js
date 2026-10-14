@@ -1,0 +1,453 @@
+// script.js — 용과같이 짤번역기
+// data.js의 jjalData를 사용합니다. (index.html에서 data.js가 먼저 불러와져야 해요)
+
+// ================= 1. 한글 도우미 =================
+
+const HANGUL_START = 0xac00;
+const HANGUL_END = 0xd7a3;
+const IEUNG = 11; // 초성 'ㅇ'
+// 어미가 붙을 때 어간 모음이 바뀌는 경우 (모음 번호: ㅏ0 ㅐ1 ㅓ4 ㅕ6 ㅗ8 ㅘ9 ㅜ13 ㅝ14 ㅡ18 ㅣ20)
+// 예: 지치+었다 → 지쳤다(ㅣ→ㅕ), 슬프+어 → 슬퍼(ㅡ→ㅓ), 망하+였다 → 망했다(ㅏ→ㅐ)
+const VOWEL_CHANGES = { 0: [1], 8: [9], 13: [14], 18: [4], 20: [6] };
+
+// 한글 글자 하나를 초성/중성/종성 번호로 쪼개기 (한글이 아니면 null)
+function syllableInfo(ch) {
+  const code = ch.charCodeAt(0);
+  if (code < HANGUL_START || code > HANGUL_END) return null;
+  const n = code - HANGUL_START;
+  return { initial: Math.floor(n / 588), vowel: Math.floor((n % 588) / 28), final: n % 28 };
+}
+
+// 공백, 특수문자를 지우고 소문자로 바꿔서 비교하기 쉽게 만들기
+function normalize(text) {
+  return String(text).toLowerCase().replace(/[^0-9a-z가-힣ㄱ-ㅎㅏ-ㅣ]/g, "");
+}
+
+// 어간 키워드 느슨하게 찾기
+// "지치" → 지쳤다/지친/지쳐, "화나" → 화났다/화난, "고마" → 고맙다/고마워
+function looseIncludes(text, keyword) {
+  if (keyword.length < 2) return false;
+  const last = syllableInfo(keyword[keyword.length - 1]);
+  // 받침 없는 한글로 끝나는 어간만 처리 (초성 ㅇ은 구분이 어려워 제외)
+  if (!last || last.final !== 0 || last.initial === IEUNG) return false;
+
+  const stem = keyword.slice(0, -1);
+  let from = 0;
+  while (true) {
+    const idx = text.indexOf(stem, from);
+    if (idx === -1) return false;
+    const next = text[idx + stem.length];
+    const info = next ? syllableInfo(next) : null;
+    if (
+      info &&
+      info.initial === last.initial &&
+      (info.vowel === last.vowel || (VOWEL_CHANGES[last.vowel] || []).includes(info.vowel))
+    ) {
+      return true;
+    }
+    from = idx + 1;
+  }
+}
+
+// 글자를 두 개씩 묶은 집합 만들기 ("지쳤다" → 지쳤, 쳤다)
+function bigrams(text) {
+  const set = new Set();
+  for (let i = 0; i < text.length - 1; i++) set.add(text.slice(i, i + 2));
+  return set;
+}
+
+// 두 집합이 얼마나 비슷한지 0~1 사이 숫자로
+function similarity(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  a.forEach(x => {
+    if (b.has(x)) shared++;
+  });
+  return (2 * shared) / (a.size + b.size);
+}
+
+// ================= 2. 검색(짤 고르기) 로직 =================
+
+const MAX_RESULTS = 6;   // 한 번에 보여줄 최대 짤 개수
+const MIN_SHOW = 3;      // 최소로 채워서 보여줄 개수
+const MIN_SCORE = 2;     // 이 점수 미만이면 "관련 없음"으로 봄
+const KEEP_RATIO = 0.35; // 1등 점수의 35% 미만인 짤은 제외
+const GREAT_SCORE = 10;  // 이 점수 이상이면 "찰떡" 표시
+
+// 미리 계산해 두기: 각 짤의 키워드/예시 문장, 그리고 키워드 희소성(IDF)
+const prepared = jjalData.map(item => ({
+  item,
+  keywords: [...new Set(item.keywords.map(normalize).filter(Boolean))],
+  phrases: item.phrases.map(p => {
+    const n = normalize(p);
+    return { n, b: bigrams(n) };
+  })
+}));
+
+const docFreq = new Map();
+prepared.forEach(p => p.keywords.forEach(k => docFreq.set(k, (docFreq.get(k) || 0) + 1)));
+// 여러 짤에 흔하게 나오는 단어일수록 점수를 낮추고, 한 짤에만 있는 단어는 높게
+function keywordWeight(k) {
+  const idf = Math.log(prepared.length / docFreq.get(k)) + 1;
+  return (1 + Math.min(k.length, 4) * 0.5) * idf;
+}
+
+function scoreItem(inputText, inputBigrams, entry) {
+  // 1) 키워드: 입력 안에 들어 있으면 가산점
+  const hits = entry.keywords.filter(k => inputText.includes(k) || looseIncludes(inputText, k));
+  hits.sort((a, b) => b.length - a.length);
+  const kept = [];
+  for (const k of hits) {
+    // "스티커"와 "스티커사진"처럼 겹치면 긴 쪽만 센다
+    if (!kept.some(o => o.includes(k))) kept.push(k);
+  }
+  let score = kept.reduce((sum, k) => sum + keywordWeight(k), 0);
+
+  // 2) 예시 문장과 비슷할수록 가산점
+  let best = 0;
+  for (const p of entry.phrases) {
+    if (p.n.length >= 3 && inputText.length >= 3 && (inputText.includes(p.n) || p.n.includes(inputText))) {
+      best = 1;
+      break;
+    }
+    best = Math.max(best, similarity(inputBigrams, p.b));
+  }
+  if (best >= 0.3) score += best * 10;
+
+  return score;
+}
+
+// 무작위로 count개 뽑기 (exclude에 있는 짤은 제외)
+function pickRandom(count, exclude = []) {
+  const copy = jjalData.filter(item => !exclude.includes(item));
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, count);
+}
+
+// 입력 문장에 어울리는 짤 찾기
+// 반환: { matched: [{item, score}], filler: [item], isRandom }
+function findJjal(query) {
+  const inputText = normalize(query);
+  if (!inputText) return { matched: [], filler: [], isRandom: false };
+
+  const inputBigrams = bigrams(inputText);
+  const scored = [];
+  for (const entry of prepared) {
+    const score = scoreItem(inputText, inputBigrams, entry);
+    if (score >= MIN_SCORE) {
+      // 점수가 같을 때 매번 다른 순서가 나오도록 아주 작은 랜덤값을 더함
+      scored.push({ item: entry.item, score, sortKey: score + Math.random() * 0.01 });
+    }
+  }
+
+  if (scored.length === 0) {
+    return { matched: [], filler: pickRandom(3), isRandom: true };
+  }
+
+  scored.sort((a, b) => b.sortKey - a.sortKey);
+  const top = scored[0].score;
+  let picked = scored.filter(s => s.score >= top * KEEP_RATIO);
+  if (picked.length < MIN_SHOW) picked = scored.slice(0, MIN_SHOW);
+  const matched = picked.slice(0, MAX_RESULTS).map(s => ({ item: s.item, score: s.score }));
+
+  // 딱 맞는 게 너무 적으면 랜덤으로 채우기
+  const filler =
+    matched.length < MIN_SHOW
+      ? pickRandom(MIN_SHOW - matched.length, matched.map(m => m.item))
+      : [];
+
+  return { matched, filler, isRandom: false };
+}
+
+// ================= 3. 화면 그리기 =================
+
+// 이미지 요소 만들기. 이미지 파일이 없으면 설명 상자로 대신 보여줌
+function createImage(item, className, onMissing) {
+  const img = new Image();
+  img.src = "images/" + encodeURI(item.file);
+  img.alt = item.desc;
+  img.loading = "lazy";
+  img.className = "fade" + (className ? " " + className : "");
+  img.addEventListener("load", () => img.classList.add("loaded"));
+  img.addEventListener("error", () => {
+    const box = document.createElement("div");
+    box.className = "placeholder";
+    box.textContent = item.desc + "\n[" + item.file + " 없음]";
+    img.replaceWith(box);
+    if (onMissing) onMissing();
+  });
+  return img;
+}
+
+// 클립보드 복사 (https/localhost가 아니어도 동작하도록 예비 방법 포함)
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const form = document.getElementById("search-form");
+  const input = document.getElementById("jjal-input");
+  const message = document.getElementById("message");
+  const results = document.getElementById("results");
+  const examples = document.getElementById("examples");
+  const randomBtn = document.getElementById("random-btn");
+  const shareBtn = document.getElementById("share-btn");
+  const countEl = document.getElementById("count");
+  const toast = document.getElementById("toast");
+
+  const modal = document.getElementById("modal");
+  const modalMedia = document.getElementById("modal-media");
+  const modalDesc = document.getElementById("modal-desc");
+  const modalCount = document.getElementById("modal-count");
+  const modalPhrases = document.getElementById("modal-phrases");
+  const modalDownload = document.getElementById("modal-download");
+  const modalClose = document.getElementById("modal-close");
+  const modalPrev = document.getElementById("modal-prev");
+  const modalNext = document.getElementById("modal-next");
+
+  countEl.textContent = jjalData.length;
+
+  // ---- 알림(토스트) ----
+  let toastTimer = null;
+  function showToast(text) {
+    toast.textContent = text;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("show"), 1600);
+  }
+
+  // ---- 큰 화면(모달) ----
+  let currentList = []; // 지금 화면에 나온 짤들 (좌우 넘기기용)
+  let currentIndex = 0;
+  let lastFocus = null;
+
+  function renderModal() {
+    const item = currentList[currentIndex];
+    modalMedia.replaceChildren();
+    modalDownload.hidden = false;
+    modalMedia.appendChild(
+      createImage(item, "modal-img", () => {
+        modalDownload.hidden = true; // 이미지가 없으면 저장 버튼 숨김
+      })
+    );
+    modalDesc.textContent = item.desc;
+    modalDownload.href = "images/" + encodeURI(item.file);
+    modalDownload.setAttribute("download", item.file);
+
+    const many = currentList.length > 1;
+    modalPrev.hidden = !many;
+    modalNext.hidden = !many;
+    modalCount.textContent = many ? currentIndex + 1 + " / " + currentList.length : "";
+
+    modalPhrases.replaceChildren();
+    item.phrases.slice(0, 4).forEach(text => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "phrase";
+      b.textContent = text;
+      b.addEventListener("click", async () => {
+        showToast((await copyText(text)) ? "복사했어요" : "복사하지 못했어요");
+      });
+      modalPhrases.appendChild(b);
+    });
+  }
+
+  function openModal(index) {
+    lastFocus = document.activeElement;
+    currentIndex = index;
+    renderModal();
+    modal.hidden = false;
+    document.body.classList.add("modal-open");
+    modalClose.focus();
+  }
+
+  function closeModal() {
+    modal.hidden = true;
+    modalMedia.replaceChildren();
+    document.body.classList.remove("modal-open");
+    if (lastFocus) lastFocus.focus();
+  }
+
+  function stepModal(step) {
+    if (currentList.length < 2) return;
+    currentIndex = (currentIndex + step + currentList.length) % currentList.length;
+    renderModal();
+  }
+
+  modalClose.addEventListener("click", closeModal);
+  modalPrev.addEventListener("click", () => stepModal(-1));
+  modalNext.addEventListener("click", () => stepModal(1));
+  modal.addEventListener("click", event => {
+    if (event.target === modal) closeModal(); // 바깥(어두운 영역) 클릭 시 닫기
+  });
+  document.addEventListener("keydown", event => {
+    if (modal.hidden) return;
+    if (event.key === "Escape") closeModal();
+    if (event.key === "ArrowLeft") stepModal(-1);
+    if (event.key === "ArrowRight") stepModal(1);
+    if (event.key === "Tab") {
+      // 모달 밖으로 포커스가 나가지 않게 가두기
+      const focusable = modal.querySelectorAll("button:not([hidden]), a[href]:not([hidden])");
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+
+  // ---- 결과 카드 ----
+  function createCard(entry, index) {
+    const { item, badge, filler } = entry;
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "card" + (filler ? " filler" : "");
+    card.style.setProperty("--i", index);
+    card.setAttribute("aria-label", item.desc);
+
+    card.appendChild(
+      createImage(item, "", () => {
+        card.classList.add("missing"); // 이미지가 없으면 설명이 이미 보이므로 캡션 숨김
+      })
+    );
+
+    const caption = document.createElement("span");
+    caption.className = "caption";
+    caption.textContent = item.desc;
+    card.appendChild(caption);
+
+    if (badge) {
+      const tag = document.createElement("span");
+      tag.className = "badge";
+      tag.textContent = badge;
+      card.appendChild(tag);
+    }
+
+    card.addEventListener("click", () => openModal(index));
+    return card;
+  }
+
+  function showResults(entries) {
+    currentList = entries.map(e => e.item);
+    results.replaceChildren();
+    entries.forEach((entry, i) => results.appendChild(createCard(entry, i)));
+  }
+
+  // ---- 주소에 검색어 남기기 (공유용) ----
+  function syncUrl(q) {
+    try {
+      const url = new URL(location.href);
+      if (q) url.searchParams.set("q", q);
+      else url.searchParams.delete("q");
+      history.replaceState(null, "", url);
+    } catch (e) {
+      /* 로컬 파일로 열었을 때는 무시 */
+    }
+  }
+
+  // ---- 검색 ----
+  function search(query) {
+    const text = query.trim();
+    if (!text) {
+      message.textContent = "할 말을 먼저 입력해 주세요.";
+      results.replaceChildren();
+      currentList = [];
+      shareBtn.hidden = true;
+      return;
+    }
+
+    const { matched, filler, isRandom } = findJjal(text);
+    const entries = [];
+
+    matched.forEach((m, i) => {
+      entries.push({ item: m.item, badge: i === 0 && m.score >= GREAT_SCORE ? "찰떡" : "" });
+    });
+    filler.forEach(item => entries.push({ item, badge: "랜덤", filler: true }));
+
+    if (isRandom) {
+      message.textContent = "이 말에 맞는 짤을 못 찾았어요. 다른 표현으로 입력하거나, 랜덤 짤을 구경해 보세요.";
+    } else if (filler.length) {
+      message.textContent = "“" + text + "”에 어울리는 짤은 " + matched.length + "장이에요. 나머지는 랜덤으로 채웠어요.";
+    } else {
+      message.textContent = "“" + text + "”에 어울리는 짤 " + matched.length + "장";
+    }
+
+    showResults(entries);
+    syncUrl(text);
+    shareBtn.hidden = !/^https?:/.test(location.protocol) || isRandom;
+  }
+
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    search(input.value);
+  });
+
+  randomBtn.addEventListener("click", () => {
+    message.textContent = "랜덤으로 가져왔어요.";
+    showResults(pickRandom(MAX_RESULTS).map(item => ({ item, badge: "" })));
+    syncUrl("");
+    shareBtn.hidden = true;
+  });
+
+  shareBtn.addEventListener("click", async () => {
+    showToast((await copyText(location.href)) ? "링크를 복사했어요" : "복사하지 못했어요");
+  });
+
+  // ---- 예시 문장 버튼: 데이터의 예시 문장에서 무작위로 뽑아서 항상 결과가 나오게 ----
+  function renderExamples() {
+    examples.replaceChildren();
+    pickRandom(5).forEach(item => {
+      const sentence = item.phrases[Math.floor(Math.random() * item.phrases.length)];
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.textContent = sentence;
+      chip.addEventListener("click", () => {
+        input.value = sentence;
+        search(sentence);
+      });
+      examples.appendChild(chip);
+    });
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "chip refresh";
+    refresh.textContent = "다른 예시";
+    refresh.addEventListener("click", renderExamples);
+    examples.appendChild(refresh);
+  }
+  renderExamples();
+
+  // ---- 시작할 때: 주소에 검색어가 있으면 바로 검색 ----
+  const initial = new URLSearchParams(location.search).get("q");
+  if (initial && initial.trim()) {
+    input.value = initial;
+    search(initial);
+  } else {
+    message.textContent = "지금 기분이나 하고 싶은 말을 적어 보세요.";
+  }
+});

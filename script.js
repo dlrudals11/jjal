@@ -1,4 +1,4 @@
-// script.js — 용과같이 짤번역기
+// script.js — my 짤 번역기
 // data.js의 jjalData를 사용합니다. (index.html에서 data.js가 먼저 불러와져야 해요)
 
 // ================= 1. 한글 도우미 =================
@@ -183,6 +183,7 @@ const AI = {
   enabled: AI_ENDPOINT.trim() !== "",
   cooldownUntil: 0,   // 사용량 한도에 걸렸을 때 잠시 쉬는 시간
   cache: new Map(),   // 같은 문장은 다시 묻지 않고 저장된 결과를 씀
+  pending: new Map(), // 지금 묻는 중인 문장 (같은 문장을 두 번 묻지 않게)
   lastRaw: ""         // Gemini가 마지막으로 보낸 답 (?debug=1 확인용)
 };
 
@@ -214,8 +215,19 @@ const CATALOG = jjalData
   .map((item, i) => (i + 1) + ". " + item.desc + " / 예시: " + item.phrases.join(" | "))
   .join("\n");
 
+// 같은 문장은 한 번만 묻게 감싼 함수 (펀치 연출 중에 미리 물어볼 때 필요해요)
+function geminiScores(text) {
+  if (AI.cache.has(text)) return Promise.resolve(AI.cache.get(text));
+  if (AI.pending.has(text)) return AI.pending.get(text);
+  const p = fetchGeminiScores(text);
+  AI.pending.set(text, p);
+  const done = () => AI.pending.delete(text);
+  p.then(done, done);
+  return p;
+}
+
 // Gemini에게 묻고, prepared와 같은 순서의 점수 목록을 돌려줌: [{score, raw}]
-async function geminiScores(text) {
+async function fetchGeminiScores(text) {
   if (AI.cache.has(text)) return AI.cache.get(text);
 
   const ctrl = new AbortController();
@@ -478,6 +490,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ---- 검색 ----
   let searchToken = 0; // 검색이 연달아 일어났을 때 오래된 결과를 버리기 위한 번호
+  let lastIsRandom = false; // 마지막으로 그린 결과가 "맞는 짤 없음"이었는지
 
   // 결과 그리기. sem이 있으면 AI 점수까지 합쳐서, pending이면 "AI가 고르는 중" 표시
   function render(text, sem, pending) {
@@ -502,12 +515,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     if (pending) message.textContent += " (AI가 다시 고르는 중…)";
 
+    lastIsRandom = isRandom;
     showResults(entries);
     syncUrl(text);
     shareBtn.hidden = !/^https?:/.test(location.protocol) || isRandom;
   }
 
-  async function search(query) {
+  async function search(query, aiPromise = null) {
     const text = query.trim();
     const token = ++searchToken;
     if (!text) {
@@ -527,7 +541,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // 2) Gemini 결과가 오면 합쳐서 다시 보여주기
     try {
-      const sem = await geminiScores(text);
+      const sem = await (aiPromise || geminiScores(text));
       const found = sem.filter(x => x.raw > 0).length;
       setAiStatus(
         DEBUG
@@ -567,17 +581,372 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  form.addEventListener("submit", event => {
-    event.preventDefault();
-    search(input.value);
+  // ================= 무대 연출 =================
+  // 흐름: 키류가 말을 건다 → 검색어 입력 → 펀치 → 화면이 깨짐 + 연기 → 결과 공개
+  // 시간은 아래 숫자(밀리초)로 조절해요.
+  const FX = {
+    typeSpeed: 45,   // 말풍선 글자가 나오는 속도
+    windup: 280,     // 펀치를 날리기 전 잠깐 멈추는 시간
+    lunge: 460,      // 키류가 달려드는 시간
+    minHold: 700,    // 화면이 깨진 뒤 최소로 머무는 시간
+    maxWait: 3500,   // AI 답을 기다리는 최대 시간 (이 시간이 지나면 키워드 결과부터 보여줘요)
+    fall: 1150,      // 유리 조각이 떨어지는 시간
+    banner: 1900     // "여기 너에게 적합한 짤들이다!" 문구가 보이는 시간
+  };
+
+  const stage = document.getElementById("stage");
+  const resultsView = document.getElementById("results-view");
+  const app = document.getElementById("app");
+  const bubbleText = document.getElementById("bubble-text");
+  const kiryuWrap = document.getElementById("kiryu");
+  const kiryuImg = document.getElementById("kiryu-img");
+  const kiryuPh = document.getElementById("kiryu-ph");
+  const fxLayer = document.getElementById("fx");
+  const glass = document.getElementById("glass");
+  const smoke = document.getElementById("smoke");
+  const flash = document.getElementById("flash");
+  const banner = document.getElementById("banner");
+  const fxToggle = document.getElementById("fx-toggle");
+  const backBtn = document.getElementById("back-btn");
+  const randomStage = document.getElementById("random-stage");
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  let busy = false;
+
+  // ---- 배경: 검색할 때마다 카무로쵸 거리 사진이 한 장씩 바뀌어요 (4장이 한 바퀴) ----
+  // 파일은 ui/ 폴더에 있어요. soft: true 는 해상도가 낮은 사진이라 살짝 흐리게 보여 줘요.
+  const BACKDROPS = [
+    { src: "ui/bg1.jpg", soft: true }, // 천하일통 아케이드
+    { src: "ui/bg2.jpg" },             // 푸른 네온 골목
+    { src: "ui/bg3.jpg", soft: true }, // 도톤보리
+    { src: "ui/bg4.jpg" }              // 돈키호테 앞 거리
+  ];
+  const bdLayers = Array.from(document.querySelectorAll("#backdrop .bd"));
+  let bdIndex = 1; // 처음엔 해상도가 높은 사진부터 시작해요
+  let bdFront = 0;
+
+  function paintBackdrop(layer, i) {
+    layer.style.backgroundImage = 'url("' + BACKDROPS[i].src + '")';
+    layer.classList.toggle("soft", !!BACKDROPS[i].soft);
+  }
+
+  function initBackdrop() {
+    try {
+      const saved = parseInt(localStorage.getItem("jjalBd"), 10); // 새로고침해도 이어서 돌아요
+      if (saved >= 0 && saved < BACKDROPS.length) bdIndex = saved;
+    } catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
+    BACKDROPS.forEach(b => { new Image().src = b.src; }); // 미리 받아 두기
+    paintBackdrop(bdLayers[0], bdIndex);
+    bdLayers[0].classList.add("on");
+  }
+
+  function nextBackdrop() {
+    bdIndex = (bdIndex + 1) % BACKDROPS.length;
+    const back = bdLayers[1 - bdFront];
+    paintBackdrop(back, bdIndex);
+    back.classList.add("on");
+    bdLayers[bdFront].classList.remove("on");
+    bdFront = 1 - bdFront;
+    try {
+      localStorage.setItem("jjalBd", String(bdIndex));
+    } catch (e) { /* 무시 */ }
+  }
+
+  // ---- 결과 화면의 키류(마지막 사진) ----
+  const resultKiryu = document.getElementById("result-kiryu");
+  resultKiryu.addEventListener("error", () => { resultKiryu.hidden = true; }); // 파일이 없으면 숨김
+
+  function enterResults() {
+    resultsView.classList.add("enter"); // 키류가 옆에서 걸어 들어와요
+    setTimeout(() => resultsView.classList.remove("enter"), 1600);
+  }
+
+  // 연출을 끄고 켠 설정은 이 브라우저에 기억해요
+  try {
+    if (localStorage.getItem("jjalFx") === "off") fxToggle.checked = false;
+  } catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
+  fxToggle.addEventListener("change", () => {
+    try {
+      localStorage.setItem("jjalFx", fxToggle.checked ? "on" : "off");
+    } catch (e) { /* 무시 */ }
+  });
+  const fxOn = () => fxToggle.checked && !reduceMotion.matches;
+
+  function showView(name) {
+    document.body.dataset.view = name;
+    stage.hidden = name !== "stage";
+    resultsView.hidden = name !== "results";
+    window.scrollTo(0, 0);
+  }
+
+  // ---- 키류 이미지: ui/kiryu_stand.png(서 있는 모습), ui/kiryu_punch.png(펀치하는 모습) ----
+  // 파일이 아직 없으면 점선 상자로 대신 보여줘요. (연출은 똑같이 돌아가요)
+  const kiryuFile = { stand: "ui/kiryu_stand.png", punch: "ui/kiryu_punch.png" };
+  const kiryuLabel = { stand: "서 있는 모습", punch: "펀치하는 모습" };
+  const kiryuOk = {}; // 파일이 있는지 (true/false, 아직 모르면 비어 있음)
+  let kiryuPose = "stand";
+
+  function setKiryu(pose) {
+    kiryuPose = pose;
+    if (kiryuOk[pose] === false) {
+      kiryuImg.hidden = true;
+      kiryuPh.hidden = false;
+      kiryuPh.textContent = kiryuFile[pose] + "\n파일을 넣어 주세요\n(" + kiryuLabel[pose] + ", 배경 투명 PNG)";
+    } else {
+      kiryuPh.hidden = true;
+      kiryuImg.hidden = false;
+      kiryuImg.src = kiryuFile[pose];
+    }
+  }
+  Object.keys(kiryuFile).forEach(pose => {
+    const probe = new Image();
+    probe.onload = () => { kiryuOk[pose] = true; if (kiryuPose === pose) setKiryu(pose); };
+    probe.onerror = () => { kiryuOk[pose] = false; if (kiryuPose === pose) setKiryu(pose); };
+    probe.src = kiryuFile[pose];
   });
 
-  randomBtn.addEventListener("click", () => {
+  // ---- 말풍선 (한 글자씩 나오는 효과) ----
+  let typeToken = 0;
+  async function typeBubble(text) {
+    const token = ++typeToken;
+    bubbleText.textContent = "";
+    if (reduceMotion.matches) {
+      bubbleText.textContent = text;
+      return;
+    }
+    for (const ch of text) {
+      if (token !== typeToken) return; // 새 말풍선이 시작되면 이전 것은 멈춤
+      bubbleText.textContent += ch;
+      await sleep(FX.typeSpeed);
+    }
+  }
+
+  // ---- 유리 깨짐: 중심에서 퍼지는 금 + 조각 ----
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function svgEl(name, attrs) {
+    const el = document.createElementNS(SVG_NS, name);
+    Object.keys(attrs).forEach(k => el.setAttribute(k, attrs[k]));
+    return el;
+  }
+
+  function buildGlass() {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const cx = W / 2;
+    const cy = H * 0.46;
+    const RAYS = 14;
+    const RINGS = [0.07, 0.15, 0.27, 0.43, 0.66, 1.3];
+    const R = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy));
+    glass.setAttribute("viewBox", "0 0 " + W + " " + H);
+    glass.replaceChildren();
+
+    const baseAngles = [];
+    for (let i = 0; i < RAYS; i++) baseAngles.push((i / RAYS) * Math.PI * 2 + (Math.random() - 0.5) * 0.25);
+    const pts = RINGS.map(f =>
+      baseAngles.map(a => {
+        const ang = a + (Math.random() - 0.5) * 0.12;
+        const r = R * f * (0.85 + Math.random() * 0.3);
+        return [cx + Math.cos(ang) * r, cy + Math.sin(ang) * r];
+      })
+    );
+    const fmt = p => p[0].toFixed(1) + "," + p[1].toFixed(1);
+
+    // 조각
+    const shards = svgEl("g", {});
+    RINGS.forEach((_, k) => {
+      for (let i = 0; i < RAYS; i++) {
+        const j = (i + 1) % RAYS;
+        const poly = k === 0 ? [[cx, cy], pts[0][i], pts[0][j]] : [pts[k - 1][i], pts[k - 1][j], pts[k][j], pts[k][i]];
+        const mx = poly.reduce((s, p) => s + p[0], 0) / poly.length;
+        const my = poly.reduce((s, p) => s + p[1], 0) / poly.length;
+        const dist = Math.hypot(mx - cx, my - cy) / R;
+        const el = svgEl("polygon", { points: poly.map(fmt).join(" "), class: "shard" });
+        el.style.fill = "rgba(190,215,255," + (0.04 + Math.random() * 0.08).toFixed(3) + ")";
+        el.style.setProperty("--d", (dist * 380 + Math.random() * 140).toFixed(0) + "ms");
+        el.style.setProperty("--tx", ((mx - cx) * 0.08 + (Math.random() - 0.5) * 60).toFixed(0) + "px");
+        el.style.setProperty("--ty", (H * (0.7 + Math.random() * 0.5)).toFixed(0) + "px");
+        el.style.setProperty("--rot", ((Math.random() - 0.5) * 160).toFixed(0) + "deg");
+        shards.appendChild(el);
+      }
+    });
+    glass.appendChild(shards);
+
+    // 금(균열): 중심에서 뻗는 선 + 군데군데 이어진 고리
+    const cracks = svgEl("g", { class: "cracks" });
+    const addCrack = (d, delay) => {
+      const path = svgEl("path", { d, class: "crack", pathLength: "1" });
+      path.style.animationDelay = delay.toFixed(0) + "ms";
+      cracks.appendChild(path);
+    };
+    for (let i = 0; i < RAYS; i++) {
+      let d = "M" + cx.toFixed(1) + "," + cy.toFixed(1);
+      RINGS.forEach((_, k) => { d += " L" + fmt(pts[k][i]); });
+      addCrack(d, Math.random() * 110);
+    }
+    RINGS.forEach((_, k) => {
+      for (let i = 0; i < RAYS; i++) {
+        if (Math.random() > 0.72) continue; // 일부 구간은 빼서 자연스럽게
+        const j = (i + 1) % RAYS;
+        addCrack("M" + fmt(pts[k][i]) + " L" + fmt(pts[k][j]), 50 + k * 40 + Math.random() * 60);
+      }
+    });
+    glass.appendChild(cracks);
+  }
+
+  // ---- 연기 ----
+  function spawnSmoke(count) {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    for (let i = 0; i < count; i++) {
+      const el = document.createElement("div");
+      el.className = "puff";
+      el.style.setProperty("--w", (140 + Math.random() * 220).toFixed(0) + "px");
+      el.style.setProperty("--x", (W / 2 + (Math.random() - 0.5) * W * 0.7).toFixed(0) + "px");
+      el.style.setProperty("--y", (H * 0.55 + (Math.random() - 0.2) * H * 0.3).toFixed(0) + "px");
+      el.style.setProperty("--dx", ((Math.random() - 0.5) * 160).toFixed(0) + "px");
+      el.style.setProperty("--dy", (-60 - Math.random() * 180).toFixed(0) + "px");
+      el.style.setProperty("--delay", (Math.random() * 500).toFixed(0) + "ms");
+      el.style.setProperty("--dur", (2200 + Math.random() * 1200).toFixed(0) + "ms");
+      smoke.appendChild(el);
+    }
+  }
+
+  function resetStage() {
+    kiryuWrap.classList.remove("lunge");
+    stage.classList.remove("hit");
+    app.classList.remove("shake");
+    fxLayer.hidden = true;
+    fxLayer.classList.remove("fall");
+    glass.replaceChildren();
+    smoke.replaceChildren();
+    flash.classList.remove("on");
+    setKiryu("stand");
+  }
+
+  function startIntro() {
+    resetStage();
+    typeBubble("하고 싶은 말을 써라");
+    // 터치 기기는 자동으로 키보드가 올라오면 화면을 가려서 건너뜀
+    if (!window.matchMedia("(hover: none)").matches) input.focus();
+  }
+
+  function showBanner(text) {
+    banner.textContent = text;
+    banner.hidden = false;
+    banner.style.animation = "none";
+    void banner.offsetWidth; // 애니메이션을 처음부터 다시 시작
+    banner.style.animation = "";
+    setTimeout(() => { banner.hidden = true; }, FX.banner);
+  }
+
+  // 펀치 → 화면 깨짐 → 결과 공개
+  async function playSequence(text, aiPromise) {
+    stage.classList.add("hit");
+    typeToken++; // 진행 중인 말풍선 타이핑 중단
+    bubbleText.textContent = "호랑이... 떨구기!!";
+    await sleep(FX.windup);
+
+    setKiryu("punch");
+    kiryuWrap.classList.add("lunge");
+    await sleep(FX.lunge);
+
+    // 충돌: 번쩍 + 흔들림 + 금 + 연기
+    fxLayer.hidden = false;
+    flash.classList.remove("on");
+    void flash.offsetWidth;
+    flash.classList.add("on");
+    app.classList.add("shake");
+    setTimeout(() => app.classList.remove("shake"), 520);
+    buildGlass();
+    spawnSmoke(16);
+
+    // 금이 간 채로 잠깐 머물며, 그 사이 AI 답을 기다려요
+    await sleep(FX.minHold);
+    if (aiPromise) await Promise.race([aiPromise.catch(() => {}), sleep(FX.maxWait)]);
+
+    // 공개: 뒤에서 결과를 그리고, 유리 조각이 떨어지며 걷혀요
+    nextBackdrop(); // 유리가 깨진 자리에 다음 거리 사진이 나와요
+    showView("results");
+    enterResults();
+    search(text, aiPromise).catch(() => {});
+    spawnSmoke(8);
+    showBanner(lastIsRandom ? "음... 딱 맞는 건 없다. 이거라도 봐라!" : "여기 너에게 적합한 짤들이다!");
+    fxLayer.classList.add("fall");
+    await sleep(FX.fall);
+
+    fxLayer.hidden = true;
+    fxLayer.classList.remove("fall");
+    glass.replaceChildren();
+    smoke.replaceChildren();
+    kiryuWrap.classList.remove("lunge");
+    stage.classList.remove("hit");
+  }
+
+  // 연출이 도는 동안 AI에게 미리 물어봐요 (연출이 로딩 시간을 가려 줘요)
+  function startAI(text) {
+    if (!AI.enabled || AI.cache.has(text) || Date.now() < AI.cooldownUntil) return null;
+    const p = geminiScores(text);
+    p.catch(() => {}); // 오류는 search()가 화면에 알려 줘요
+    return p;
+  }
+
+  function nudge() {
+    typeBubble("말을 해야 알지!");
+    input.classList.remove("nudge");
+    void input.offsetWidth;
+    input.classList.add("nudge");
+    input.focus();
+  }
+
+  async function go(raw) {
+    if (busy) return;
+    const text = raw.trim();
+    if (!text) {
+      nudge();
+      return;
+    }
+    busy = true;
+    try {
+      if (!fxOn()) {
+        nextBackdrop();
+        showView("results"); // 연출을 끈 경우: 바로 결과
+        search(text);
+        return;
+      }
+      await playSequence(text, startAI(text));
+    } finally {
+      busy = false;
+    }
+  }
+
+  function showRandom() {
     searchToken++; // 진행 중인 검색 취소
+    nextBackdrop();
+    showView("results");
     message.textContent = "랜덤으로 가져왔어요.";
     showResults(pickRandom(MAX_RESULTS).map(item => ({ item, badge: "" })));
     syncUrl("");
     shareBtn.hidden = true;
+  }
+
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    go(input.value);
+  });
+
+  randomBtn.addEventListener("click", showRandom);
+  randomStage.addEventListener("click", () => {
+    if (!busy) showRandom();
+  });
+
+  backBtn.addEventListener("click", () => {
+    if (busy) return;
+    searchToken++; // 아직 도착하지 않은 AI 결과는 버림
+    showView("stage");
+    syncUrl("");
+    shareBtn.hidden = true;
+    input.value = "";
+    startIntro();
   });
 
   shareBtn.addEventListener("click", async () => {
@@ -595,7 +964,7 @@ document.addEventListener("DOMContentLoaded", () => {
       chip.textContent = sentence;
       chip.addEventListener("click", () => {
         input.value = sentence;
-        search(sentence);
+        go(sentence);
       });
       examples.appendChild(chip);
     });
@@ -623,13 +992,17 @@ document.addEventListener("DOMContentLoaded", () => {
     aiStatus.style.display = "none"; // 키가 없으면 키워드 검색만 사용
   }
 
-  // ---- 시작할 때: 주소에 검색어가 있으면 바로 검색 ----
+  // ---- 시작할 때: 배경부터 켜고, 주소에 검색어가 있으면 바로 검색 ----
+  initBackdrop();
   const initial = new URLSearchParams(location.search).get("q");
   if (initial && initial.trim()) {
+    // 공유받은 링크는 연출 없이 바로 결과를 보여줘요
     input.value = initial;
+    showView("results");
     search(initial);
   } else {
-    message.textContent = "지금 기분이나 하고 싶은 말을 적어 보세요.";
+    showView("stage");
+    startIntro();
   }
 
 });

@@ -74,11 +74,20 @@ const MIN_SCORE = 2;     // 이 점수 미만이면 "관련 없음"으로 봄
 const KEEP_RATIO = 0.35; // 1등 점수의 35% 미만인 짤은 제외
 const GREAT_SCORE = 10;  // 이 점수 이상이면 "찰떡" 표시
 
+// ---- 시리즈 (data.js의 series 값으로 자동으로 만들어져요) ----
+const SERIES = [...new Set(jjalData.map(item => item.series).filter(Boolean))];
+let activeSeries = "전체";
+try {
+  const saved = localStorage.getItem("jjalSeries");
+  if (saved && SERIES.includes(saved)) activeSeries = saved;
+} catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
+const inSeries = item => activeSeries === "전체" || item.series === activeSeries;
+
 // 미리 계산해 두기: 각 짤의 키워드/예시 문장, 그리고 키워드 희소성(IDF)
 const prepared = jjalData.map(item => ({
   item,
-  keywords: [...new Set(item.keywords.map(normalize).filter(Boolean))],
-  phrases: item.phrases.map(p => {
+  keywords: [...new Set((item.keywords || []).map(normalize).filter(Boolean))],
+  phrases: (item.phrases || []).map(p => {
     const n = normalize(p);
     return { n, b: bigrams(n) };
   })
@@ -119,7 +128,7 @@ function scoreItem(inputText, inputBigrams, entry) {
 
 // 무작위로 count개 뽑기 (exclude에 있는 짤은 제외)
 function pickRandom(count, exclude = []) {
-  const copy = jjalData.filter(item => !exclude.includes(item));
+  const copy = jjalData.filter(item => !exclude.includes(item) && inSeries(item));
   for (let i = copy.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [copy[i], copy[j]] = [copy[j], copy[i]];
@@ -137,6 +146,7 @@ function findJjal(query, sem = null) {
   const inputBigrams = bigrams(inputText);
   const scored = [];
   prepared.forEach((entry, idx) => {
+    if (!inSeries(entry.item)) return; // 선택한 시리즈만
     const kw = scoreItem(inputText, inputBigrams, entry);
     const ai = sem ? sem[idx] : { score: 0, raw: 0 };
     const score = kw + ai.score;
@@ -212,7 +222,7 @@ function parsePicks(raw) {
 
 // 짤 목록 (Worker가 자기 지시문과 합쳐서 Gemini에 보내요. 지시문은 worker.js에 있어요)
 const CATALOG = jjalData
-  .map((item, i) => (i + 1) + ". " + item.desc + " / 예시: " + item.phrases.join(" | "))
+  .map((item, i) => (i + 1) + ". " + item.desc + ((item.phrases || []).length ? " / 예시: " + item.phrases.join(" | ") : ""))
   .join("\n");
 
 // 같은 문장은 한 번만 묻게 감싼 함수 (펀치 연출 중에 미리 물어볼 때 필요해요)
@@ -329,6 +339,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const modal = document.getElementById("modal");
   const modalMedia = document.getElementById("modal-media");
   const modalDesc = document.getElementById("modal-desc");
+  const modalSeries = document.getElementById("modal-series");
+  const modalCopy = document.getElementById("modal-copy");
+  const modalShare = document.getElementById("modal-share");
+  const modalWish = document.getElementById("modal-wish");
   const modalCount = document.getElementById("modal-count");
   const modalPhrases = document.getElementById("modal-phrases");
   const modalDownload = document.getElementById("modal-download");
@@ -356,11 +370,20 @@ document.addEventListener("DOMContentLoaded", () => {
     const item = currentList[currentIndex];
     modalMedia.replaceChildren();
     modalDownload.hidden = false;
+    modalCopy.hidden = false;
+    modalShare.hidden = !canShareFiles;
     modalMedia.appendChild(
       createImage(item, "modal-img", () => {
-        modalDownload.hidden = true; // 이미지가 없으면 저장 버튼 숨김
+        // 이미지가 없으면 저장/복사/공유 버튼 숨김
+        modalDownload.hidden = true;
+        modalCopy.hidden = true;
+        modalShare.hidden = true;
       })
     );
+    modalSeries.textContent = item.series || "";
+    modalSeries.hidden = !item.series;
+    modalWish.dataset.file = item.file;
+    refreshWishUI();
     modalDesc.textContent = item.desc;
     modalDownload.href = "images/" + encodeURI(item.file);
     modalDownload.setAttribute("download", item.file);
@@ -371,7 +394,7 @@ document.addEventListener("DOMContentLoaded", () => {
     modalCount.textContent = many ? currentIndex + 1 + " / " + currentList.length : "";
 
     modalPhrases.replaceChildren();
-    item.phrases.slice(0, 4).forEach(text => {
+    (item.phrases || []).slice(0, 4).forEach(text => {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "phrase";
@@ -397,6 +420,7 @@ document.addEventListener("DOMContentLoaded", () => {
     modalMedia.replaceChildren();
     document.body.classList.remove("modal-open");
     if (lastFocus) lastFocus.focus();
+    if (mode === "wish") showWish(); // 모달에서 찜을 해제했다면 목록에서도 빼요
   }
 
   function stepModal(step) {
@@ -405,6 +429,10 @@ document.addEventListener("DOMContentLoaded", () => {
     renderModal();
   }
 
+  modalCopy.addEventListener("click", () => copyImage(currentList[currentIndex]));
+  modalShare.addEventListener("click", () => shareImage(currentList[currentIndex]));
+  modalWish.classList.add("wish-btn");
+  modalWish.addEventListener("click", () => toggleWish(currentList[currentIndex]));
   modalClose.addEventListener("click", closeModal);
   modalPrev.addEventListener("click", () => stepModal(-1));
   modalNext.addEventListener("click", () => stepModal(1));
@@ -432,12 +460,95 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  // ---- 찜(위시리스트): 이 브라우저에 저장돼요 ----
+  let wishList = [];
+  try {
+    const raw = JSON.parse(localStorage.getItem("jjalWish") || "[]");
+    if (Array.isArray(raw)) wishList = raw;
+  } catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
+  const isWished = item => wishList.includes(item.file);
+  const wishItems = () => wishList.map(f => jjalData.find(i => i.file === f)).filter(Boolean);
+
+  // ---- 이미지 복사 / 공유 ----
+  // 클립보드는 PNG만 받아서, JPG/WEBP는 PNG로 바꿔서 복사해요. (GIF는 첫 장면만 복사돼요)
+  async function imageBlob(item) {
+    const res = await fetch("images/" + encodeURI(item.file));
+    if (!res.ok) throw new Error("이미지를 불러오지 못했어요");
+    return res.blob();
+  }
+
+  async function imageToPng(item) {
+    const blob = await imageBlob(item);
+    if (blob.type === "image/png") return blob;
+    const bmp = await createImageBitmap(blob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    canvas.getContext("2d").drawImage(bmp, 0, 0);
+    return new Promise((ok, no) => canvas.toBlob(b => (b ? ok(b) : no(new Error("변환 실패"))), "image/png"));
+  }
+
+  async function copyImage(item) {
+    if (!(navigator.clipboard && window.ClipboardItem)) {
+      showToast("이 브라우저는 이미지 복사를 지원하지 않아요. 저장을 써 주세요");
+      return;
+    }
+    try {
+      // 약속(Promise)째로 넘겨야 사파리/모바일에서도 눌렀을 때 허용돼요
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": imageToPng(item) })]);
+      showToast(/\.gif$/i.test(item.file) ? "복사했어요 (GIF는 첫 장면만 복사돼요)" : "이미지를 복사했어요");
+    } catch (e) {
+      showToast("복사하지 못했어요. 저장이나 공유를 써 주세요");
+    }
+  }
+
+  const canShareFiles = !!(
+    navigator.canShare && navigator.canShare({ files: [new File(["x"], "a.png", { type: "image/png" })] })
+  );
+
+  async function shareImage(item) {
+    try {
+      const blob = await imageBlob(item);
+      const file = new File([blob], item.file, { type: blob.type || "image/png" });
+      await navigator.share({ files: [file] });
+    } catch (e) {
+      if (e && e.name !== "AbortError") showToast("공유하지 못했어요");
+    }
+  }
+
+  // ---- 찜 토글 + 화면 갱신 ----
+  function toggleWish(item) {
+    const i = wishList.indexOf(item.file);
+    if (i >= 0) wishList.splice(i, 1);
+    else wishList.unshift(item.file);
+    try {
+      localStorage.setItem("jjalWish", JSON.stringify(wishList));
+    } catch (e) { /* 저장이 안 되면 이번 방문 동안만 유지돼요 */ }
+    showToast(i >= 0 ? "찜을 해제했어요" : "찜했어요 ♥");
+    refreshWishUI();
+  }
+
+  function refreshWishUI() {
+    document.querySelectorAll(".wish-btn").forEach(btn => {
+      const on = wishList.includes(btn.dataset.file);
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.textContent = btn.classList.contains("icon-btn") ? (on ? "♥" : "♡") : on ? "♥ 찜 해제" : "♡ 찜하기";
+    });
+    document.querySelectorAll(".wish-open").forEach(btn => {
+      btn.textContent = "♥ 찜 목록 " + wishList.length;
+      btn.classList.toggle("on", mode === "wish" && !resultsView.hidden);
+    });
+  }
+
   // ---- 결과 카드 ----
   function createCard(entry, index) {
     const { item, badge, filler } = entry;
-    const card = document.createElement("button");
-    card.type = "button";
+    // 카드 안에 버튼(찜/복사)이 들어가서 button 대신 div를 써요
+    const card = document.createElement("div");
     card.className = "card" + (filler ? " filler" : "");
+    card.setAttribute("role", "button");
+    card.tabIndex = 0;
     card.style.setProperty("--i", index);
     card.setAttribute("aria-label", item.desc);
 
@@ -466,7 +577,35 @@ document.addEventListener("DOMContentLoaded", () => {
       card.appendChild(tag);
     }
 
+    const actions = document.createElement("span");
+    actions.className = "card-actions";
+    const wish = document.createElement("button");
+    wish.type = "button";
+    wish.className = "icon-btn wish-btn";
+    wish.dataset.file = item.file;
+    wish.title = "찜하기";
+    wish.setAttribute("aria-label", "찜하기");
+    wish.addEventListener("click", () => toggleWish(item));
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "icon-btn copy-btn";
+    copy.textContent = "복사";
+    copy.title = "이미지 복사";
+    copy.setAttribute("aria-label", "이미지 복사");
+    copy.addEventListener("click", () => copyImage(item));
+    actions.append(wish, copy);
+    // 버튼을 눌렀을 때 카드가 열리지 않게
+    actions.addEventListener("click", event => event.stopPropagation());
+    actions.addEventListener("keydown", event => event.stopPropagation());
+    card.appendChild(actions);
+
     card.addEventListener("click", () => openModal(index));
+    card.addEventListener("keydown", event => {
+      if (event.target === card && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        openModal(index);
+      }
+    });
     return card;
   }
 
@@ -474,6 +613,7 @@ document.addEventListener("DOMContentLoaded", () => {
     currentList = entries.map(e => e.item);
     results.replaceChildren();
     entries.forEach((entry, i) => results.appendChild(createCard(entry, i)));
+    refreshWishUI();
   }
 
   // ---- 주소에 검색어 남기기 (공유용) ----
@@ -491,6 +631,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // ---- 검색 ----
   let searchToken = 0; // 검색이 연달아 일어났을 때 오래된 결과를 버리기 위한 번호
   let lastIsRandom = false; // 마지막으로 그린 결과가 "맞는 짤 없음"이었는지
+  let mode = "search"; // 지금 결과 화면의 종류: search(검색) / random(랜덤) / wish(찜 목록)
+  let lastQuery = "";
 
   // 결과 그리기. sem이 있으면 AI 점수까지 합쳐서, pending이면 "AI가 고르는 중" 표시
   function render(text, sem, pending) {
@@ -506,16 +648,19 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     filler.forEach(item => entries.push({ item, badge: "랜덤", filler: true }));
 
+    const seriesNote = activeSeries === "전체" ? "" : " [" + activeSeries + "]";
     if (isRandom) {
       message.textContent = "이 말에 맞는 짤을 못 찾았어요. 다른 표현으로 입력하거나, 랜덤 짤을 구경해 보세요.";
     } else if (filler.length) {
       message.textContent = "“" + text + "”에 어울리는 짤은 " + matched.length + "장이에요. 나머지는 랜덤으로 채웠어요.";
     } else {
-      message.textContent = "“" + text + "”에 어울리는 짤 " + matched.length + "장";
+      message.textContent = "“" + text + "”에 어울리는 짤 " + matched.length + "장" + seriesNote;
     }
     if (pending) message.textContent += " (AI가 다시 고르는 중…)";
 
     lastIsRandom = isRandom;
+    mode = "search";
+    lastQuery = text;
     showResults(entries);
     syncUrl(text);
     shareBtn.hidden = !/^https?:/.test(location.protocol) || isRandom;
@@ -613,52 +758,19 @@ document.addEventListener("DOMContentLoaded", () => {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   let busy = false;
 
-  // ---- 배경: 검색할 때마다 카무로쵸 거리 사진이 한 장씩 바뀌어요 (4장이 한 바퀴) ----
-  // 파일은 ui/ 폴더에 있어요. soft: true 는 해상도가 낮은 사진이라 살짝 흐리게 보여 줘요.
-  const BACKDROPS = [
-    { src: "ui/bg1.jpg", soft: true }, // 천하일통 아케이드
-    { src: "ui/bg2.jpg" },             // 푸른 네온 골목
-    { src: "ui/bg3.jpg", soft: true }, // 도톤보리
-    { src: "ui/bg4.jpg" }              // 돈키호테 앞 거리
-  ];
-  const bdLayers = Array.from(document.querySelectorAll("#backdrop .bd"));
-  let bdIndex = 1; // 처음엔 해상도가 높은 사진부터 시작해요
-  let bdFront = 0;
-
-  function paintBackdrop(layer, i) {
-    layer.style.backgroundImage = 'url("' + BACKDROPS[i].src + '")';
-    layer.classList.toggle("soft", !!BACKDROPS[i].soft);
+  // ---- 배경: 검색할 때마다 다음 사진으로 (4장이 한 바퀴) ----
+  const BG = ["ui/bg1.jpg", "ui/bg2.jpg", "ui/bg3.jpg", "ui/bg4.jpg"];
+  let bgIndex = 0;
+  try {
+    bgIndex = (parseInt(localStorage.getItem("jjalBg"), 10) || 0) % BG.length;
+  } catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
+  BG.forEach(src => { new Image().src = src; }); // 미리 불러오기
+  function applyBg() {
+    document.documentElement.style.setProperty("--bg-url", 'url("' + BG[bgIndex] + '")');
   }
-
-  function initBackdrop() {
-    try {
-      const saved = parseInt(localStorage.getItem("jjalBd"), 10); // 새로고침해도 이어서 돌아요
-      if (saved >= 0 && saved < BACKDROPS.length) bdIndex = saved;
-    } catch (e) { /* 저장소를 못 써도 괜찮아요 */ }
-    BACKDROPS.forEach(b => { new Image().src = b.src; }); // 미리 받아 두기
-    paintBackdrop(bdLayers[0], bdIndex);
-    bdLayers[0].classList.add("on");
-  }
-
-  function nextBackdrop() {
-    bdIndex = (bdIndex + 1) % BACKDROPS.length;
-    const back = bdLayers[1 - bdFront];
-    paintBackdrop(back, bdIndex);
-    back.classList.add("on");
-    bdLayers[bdFront].classList.remove("on");
-    bdFront = 1 - bdFront;
-    try {
-      localStorage.setItem("jjalBd", String(bdIndex));
-    } catch (e) { /* 무시 */ }
-  }
-
-  // ---- 결과 화면의 키류(마지막 사진) ----
-  const resultKiryu = document.getElementById("result-kiryu");
-  resultKiryu.addEventListener("error", () => { resultKiryu.hidden = true; }); // 파일이 없으면 숨김
-
-  function enterResults() {
-    resultsView.classList.add("enter"); // 키류가 옆에서 걸어 들어와요
-    setTimeout(() => resultsView.classList.remove("enter"), 1600);
+  function nextBg() {
+    bgIndex = (bgIndex + 1) % BG.length; // 다음 검색 때 보일 배경
+    try { localStorage.setItem("jjalBg", String(bgIndex)); } catch (e) { /* 무시 */ }
   }
 
   // 연출을 끄고 켠 설정은 이 브라우저에 기억해요
@@ -673,7 +785,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const fxOn = () => fxToggle.checked && !reduceMotion.matches;
 
   function showView(name) {
-    document.body.dataset.view = name;
     stage.hidden = name !== "stage";
     resultsView.hidden = name !== "results";
     window.scrollTo(0, 0);
@@ -825,6 +936,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function startIntro() {
     resetStage();
+    applyBg();
     typeBubble("하고 싶은 말을 써라");
     // 터치 기기는 자동으로 키보드가 올라오면 화면을 가려서 건너뜀
     if (!window.matchMedia("(hover: none)").matches) input.focus();
@@ -865,9 +977,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (aiPromise) await Promise.race([aiPromise.catch(() => {}), sleep(FX.maxWait)]);
 
     // 공개: 뒤에서 결과를 그리고, 유리 조각이 떨어지며 걷혀요
-    nextBackdrop(); // 유리가 깨진 자리에 다음 거리 사진이 나와요
     showView("results");
-    enterResults();
     search(text, aiPromise).catch(() => {});
     spawnSmoke(8);
     showBanner(lastIsRandom ? "음... 딱 맞는 건 없다. 이거라도 봐라!" : "여기 너에게 적합한 짤들이다!");
@@ -906,9 +1016,9 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     busy = true;
+    nextBg(); // 이번 검색은 지금 배경으로, 다음 검색은 다음 사진으로
     try {
       if (!fxOn()) {
-        nextBackdrop();
         showView("results"); // 연출을 끈 경우: 바로 결과
         search(text);
         return;
@@ -921,13 +1031,69 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function showRandom() {
     searchToken++; // 진행 중인 검색 취소
-    nextBackdrop();
+    mode = "random";
     showView("results");
-    message.textContent = "랜덤으로 가져왔어요.";
+    message.textContent = "랜덤으로 가져왔어요." + (activeSeries === "전체" ? "" : " [" + activeSeries + "]");
     showResults(pickRandom(MAX_RESULTS).map(item => ({ item, badge: "" })));
     syncUrl("");
     shareBtn.hidden = true;
   }
+
+  // 찜 목록 (선택한 시리즈가 있으면 그 시리즈만)
+  function showWish() {
+    searchToken++;
+    mode = "wish";
+    showView("results");
+    const list = wishItems().filter(inSeries);
+    if (!wishList.length) message.textContent = "아직 찜한 짤이 없어요. 카드의 ♡를 눌러 보세요.";
+    else if (!list.length) message.textContent = "이 시리즈에는 찜한 짤이 없어요.";
+    else message.textContent = "찜한 짤 " + list.length + "장" + (activeSeries === "전체" ? "" : " [" + activeSeries + "]");
+    showResults(list.map(item => ({ item, badge: "" })));
+    syncUrl("");
+    shareBtn.hidden = true;
+  }
+
+  // 지금 결과 화면을 현재 설정(시리즈 등)에 맞게 다시 그리기
+  function refreshResults() {
+    if (mode === "wish") showWish();
+    else if (mode === "random") showRandom();
+    else if (lastQuery) render(lastQuery, AI.cache.get(lastQuery) || null, false);
+  }
+
+  // ---- 시리즈 선택 버튼 ----
+  const seriesBars = Array.from(document.querySelectorAll(".series-bar"));
+  function renderSeriesBars() {
+    seriesBars.forEach(bar => {
+      bar.replaceChildren();
+      ["전체", ...SERIES].forEach(name => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "series-btn" + (name === activeSeries ? " on" : "");
+        b.textContent = name;
+        b.setAttribute("aria-pressed", name === activeSeries ? "true" : "false");
+        b.addEventListener("click", () => setSeries(name));
+        bar.appendChild(b);
+      });
+    });
+  }
+
+  function setSeries(name) {
+    if (name === activeSeries || busy) return;
+    activeSeries = name;
+    try {
+      localStorage.setItem("jjalSeries", name);
+    } catch (e) { /* 무시 */ }
+    renderSeriesBars();
+    renderExamples();
+    if (!resultsView.hidden) refreshResults();
+  }
+
+  document.getElementById("wish-open-stage").addEventListener("click", () => {
+    if (!busy) showWish();
+  });
+  document.getElementById("wish-open-results").addEventListener("click", () => {
+    if (!busy) showWish();
+  });
 
   form.addEventListener("submit", event => {
     event.preventDefault();
@@ -946,6 +1112,8 @@ document.addEventListener("DOMContentLoaded", () => {
     syncUrl("");
     shareBtn.hidden = true;
     input.value = "";
+    mode = "search";
+    lastQuery = "";
     startIntro();
   });
 
@@ -956,7 +1124,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // ---- 예시 문장 버튼: 데이터의 예시 문장에서 무작위로 뽑아서 항상 결과가 나오게 ----
   function renderExamples() {
     examples.replaceChildren();
-    pickRandom(5).forEach(item => {
+    pickRandom(30).filter(item => (item.phrases || []).length).slice(0, 5).forEach(item => {
       const sentence = item.phrases[Math.floor(Math.random() * item.phrases.length)];
       const chip = document.createElement("button");
       chip.type = "button";
@@ -977,6 +1145,8 @@ document.addEventListener("DOMContentLoaded", () => {
     examples.appendChild(refresh);
   }
   renderExamples();
+  renderSeriesBars();
+  refreshWishUI();
 
   // ---- AI 상태 표시 ----
   const aiStatus = document.getElementById("ai-status");
@@ -992,12 +1162,12 @@ document.addEventListener("DOMContentLoaded", () => {
     aiStatus.style.display = "none"; // 키가 없으면 키워드 검색만 사용
   }
 
-  // ---- 시작할 때: 배경부터 켜고, 주소에 검색어가 있으면 바로 검색 ----
-  initBackdrop();
+  // ---- 시작할 때: 주소에 검색어가 있으면 바로 검색 ----
   const initial = new URLSearchParams(location.search).get("q");
   if (initial && initial.trim()) {
     // 공유받은 링크는 연출 없이 바로 결과를 보여줘요
     input.value = initial;
+    applyBg();
     showView("results");
     search(initial);
   } else {
